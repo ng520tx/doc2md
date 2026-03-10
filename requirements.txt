@@ -1,0 +1,16 @@
+mammoth>=1.8.0
+python-docx>=1.1.0
+markdownify>=0.14.1
+Pillow>=10.0.0
+customtkinter>=5.2.0
+tkinterdnd2>=0.4.2
+pywin32>=306; sys_platform == "win32"
+
+# PDF engines (install at least one, auto-detected by priority)
+# MinerU: best for Chinese docs, table accuracy 0.87 (requires Python 3.10-3.13)
+MinerU>=2.7.0
+# Docling: best overall accuracy 0.86, table 0.89
+docling>=2.0.0
+# PyMuPDF4LLM: fastest, basic accuracy 0.40 (fallback)
+pymupdf>=1.25.0
+pymupdf4llm>=0.0.17
