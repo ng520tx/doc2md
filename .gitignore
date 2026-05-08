@@ -22,3 +22,8 @@ Thumbs.db
 
 # Output (generated files)
 output/
+
+# Internal docs (作者本地维护，不上传)
+docs/项目架构.md
+.cursor
+test

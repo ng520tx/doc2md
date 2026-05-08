@@ -117,9 +117,6 @@ def convert_docx(input_path: Path, output_dir: Path, embed_images: bool = False,
     header = _build_header(input_path, "DOCX", len(list(images_dir.glob("*"))))
     markdown_text = header + markdown_text
 
-    if not embed_images:
-        markdown_text = _add_image_index(markdown_text, images_dir, stem)
-
     if progress_cb:
         progress_cb(90, "saving...")
 
@@ -137,35 +134,276 @@ def convert_docx(input_path: Path, output_dir: Path, embed_images: bool = False,
 
 
 def _extract_doc_structure(doc) -> dict:
-    heading_texts = []
-    toc_items = []
-    in_toc = False
+    """提取文档标题结构。
+    优先级：
+    1. TOC 段落（toc 1/2/3/4 样式）有完整 level + 编号 + 文本，作为权威锚点；
+       同时扫描全部段落，借助已对齐的 (numId, ilvl) → level 映射推断 TOC 之外
+       的更深层级标题（5 级及以上），并按上下文生成 full_number。
+    2. 无 TOC 时回退：Heading X 样式 + numbering 计算编号。
+    """
+    toc_items = _extract_toc_items(doc)
 
-    numbering_info = _parse_numbering(doc)
+    if toc_items:
+        return _build_structure_from_toc(doc, toc_items)
 
+    headings = _extract_headings_by_style(doc)
+    return {"headings": headings, "toc": [], "source": "style"}
+
+
+_TOC_ALIGN_LOOKAHEAD = 80
+
+
+def _build_structure_from_toc(doc, toc_items: list[dict]) -> dict:
+    """以 TOC 为锚点，结合段落 numId+ilvl 推断更深层级标题，构建完整 headings。"""
     ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
-    counters = {}
+
+    candidates = _collect_title_candidates(doc, ns)
+    _align_candidates_to_toc(candidates, toc_items)
+    ilvl_to_level, heading_num_ids = _learn_ilvl_to_level(candidates)
+    headings = _build_headings_with_inference(
+        candidates, ilvl_to_level, heading_num_ids, toc_items
+    )
+
+    return {"headings": headings, "toc": toc_items, "source": "toc+infer"}
+
+
+def _collect_title_candidates(doc, ns: dict) -> list[dict]:
+    """扫描所有段落，收集候选标题段落。
+    候选条件：使用 Heading X 样式，或拥有 numId+ilvl（不论来自段落本身还是样式继承）。
+    跳过 TOC 段落本身（toc 1/2/3/4 样式）。"""
+    candidates = []
+    for para in doc.paragraphs:
+        text = para.text.strip()
+        if not text:
+            continue
+        style_name = para.style.name if para.style else ""
+
+        if re.match(r"toc\s*\d", style_name, re.IGNORECASE):
+            continue
+
+        num_id, ilvl = _get_para_num_info(para, ns)
+        if num_id is None and ilvl is None:
+            num_id, ilvl = _get_style_num_info(para.style, ns)
+
+        is_heading_style = bool(re.match(r"[Hh]eading\s*\d", style_name))
+        has_numbering = num_id is not None and ilvl is not None
+        if not is_heading_style and not has_numbering:
+            continue
+
+        candidates.append({
+            "text": text,
+            "style": style_name,
+            "num_id": num_id,
+            "ilvl": ilvl,
+            "is_heading_style": is_heading_style,
+            "matched_toc": None,
+        })
+    return candidates
+
+
+def _align_candidates_to_toc(candidates: list[dict], toc_items: list[dict]) -> None:
+    """按顺序把 TOC 项与候选段落对齐，给匹配项写入 matched_toc。
+    空 clean_text 的 toc 项（如 '5.2.' 占位空标题）跳过对齐——
+    它们由 _build_headings_with_inference 按 toc 顺序单独补齐。"""
+    cursor = 0
+    for toc in toc_items:
+        target = toc["clean_text"]
+        if not target:
+            continue
+        end = min(len(candidates), cursor + _TOC_ALIGN_LOOKAHEAD)
+        for i in range(cursor, end):
+            tc = candidates[i]
+            if tc["matched_toc"] is not None:
+                continue
+            if _text_similar(tc["text"], target):
+                tc["matched_toc"] = toc
+                cursor = i + 1
+                break
+
+
+def _learn_ilvl_to_level(candidates: list[dict]) -> tuple[dict, set]:
+    """从已对齐 TOC 的候选中，学习 (num_id, ilvl) → level 映射。
+    同时记录哪些 num_id 属于"标题列表"，避免把普通有序列表项当作标题。"""
+    mapping: dict = {}
+    heading_num_ids: set = set()
+    for tc in candidates:
+        if tc["matched_toc"] is None:
+            continue
+        if tc["num_id"] is None or tc["ilvl"] is None:
+            continue
+        key = (tc["num_id"], tc["ilvl"])
+        mapping[key] = tc["matched_toc"]["level"]
+        heading_num_ids.add(tc["num_id"])
+    return mapping, heading_num_ids
+
+
+def _build_headings_with_inference(candidates: list[dict],
+                                    ilvl_to_level: dict,
+                                    heading_num_ids: set,
+                                    toc_items: list[dict] | None = None) -> list[dict]:
+    """按文档顺序构建完整 headings 清单。
+    - TOC 已匹配段落：直接采用 TOC 的 level/full_number/clean_text
+    - 未匹配但属于"标题列表"段落：按映射或同 num_id 的相邻 ilvl 推断 level，
+      并基于父级 prefix 与本级计数器生成 full_number
+    - 不属于标题列表的段落：当作普通列表项跳过
+    - 未对齐到候选的 toc 项（如 '5.2.' 空标题）：按 toc 顺序补齐到合适位置
+    """
+    by_num_id: dict = {}
+    for (num_id, ilvl), level in ilvl_to_level.items():
+        by_num_id.setdefault(num_id, {})[ilvl] = level
+
+    toc_items = toc_items or []
+    toc_idx_map = {id(toc): i for i, toc in enumerate(toc_items)}
+
+    headings: list[dict] = []
+    counters: dict = {}
+    prefix_at_level: dict = {}
+    next_toc_idx = 0
+
+    def _emit(level: int, full_number: str, clean_text: str,
+              from_toc: bool) -> None:
+        for k in list(counters.keys()):
+            if k > level:
+                del counters[k]
+        for k in list(prefix_at_level.keys()):
+            if k > level:
+                del prefix_at_level[k]
+
+        if from_toc:
+            nums = re.findall(r"\d+", full_number)
+            if nums:
+                counters[level] = int(nums[-1])
+        prefix_at_level[level] = full_number.rstrip(".")
+
+        headings.append({
+            "level": level,
+            "text": _join_number_text(full_number, clean_text),
+            "full_number": full_number,
+            "clean_text": clean_text,
+        })
+
+    def _flush_toc_until(target_idx: int) -> None:
+        nonlocal next_toc_idx
+        while next_toc_idx < target_idx:
+            toc = toc_items[next_toc_idx]
+            _emit(toc["level"], toc["full_number"], toc["clean_text"], True)
+            next_toc_idx += 1
+
+    for tc in candidates:
+        level = _resolve_level(tc, ilvl_to_level, by_num_id, heading_num_ids)
+        if level is None:
+            continue
+
+        if tc["matched_toc"] is not None:
+            toc = tc["matched_toc"]
+            t_idx = toc_idx_map.get(id(toc), next_toc_idx)
+            if t_idx > next_toc_idx:
+                _flush_toc_until(t_idx)
+            _emit(toc["level"], toc["full_number"], toc["clean_text"], True)
+            next_toc_idx = t_idx + 1
+        else:
+            counters[level] = counters.get(level, 0) + 1
+            cnt = counters[level]
+            parent_prefix = ""
+            for k in range(level - 1, 0, -1):
+                if prefix_at_level.get(k):
+                    parent_prefix = prefix_at_level[k]
+                    break
+            full_number = f"{parent_prefix}.{cnt}." if parent_prefix else f"{cnt}."
+            _emit(level, full_number, tc["text"], False)
+
+    _flush_toc_until(len(toc_items))
+
+    return headings
+
+
+def _resolve_level(tc: dict, ilvl_to_level: dict,
+                   by_num_id: dict, heading_num_ids: set) -> int | None:
+    """确定一个候选段落的标题层级。返回 None 表示这不是标题。"""
+    if tc["matched_toc"] is not None:
+        return tc["matched_toc"]["level"]
+
+    if tc["is_heading_style"]:
+        m = re.match(r"[Hh]eading\s*(\d)", tc["style"])
+        if m:
+            return int(m.group(1))
+
+    if tc["num_id"] is None or tc["ilvl"] is None:
+        return None
+    if tc["num_id"] not in heading_num_ids:
+        return None
+
+    key = (tc["num_id"], tc["ilvl"])
+    if key in ilvl_to_level:
+        return ilvl_to_level[key]
+
+    same_num = by_num_id.get(tc["num_id"], {})
+    if not same_num:
+        return None
+    max_known_ilvl = max(same_num.keys())
+    max_known_level = max(same_num.values())
+    inferred = max_known_level + (tc["ilvl"] - max_known_ilvl)
+    return max(1, min(6, inferred))
+
+
+def _extract_toc_items(doc) -> list[dict]:
+    """从 docx 中提取 TOC 项。每项含 level/full_number/clean_text。"""
+    items = []
+    for para in doc.paragraphs:
+        style_name = para.style.name if para.style else ""
+        text = para.text.strip()
+
+        toc_match = re.match(r"toc\s*(\d)", style_name, re.IGNORECASE)
+        if not toc_match or not text:
+            continue
+
+        level = int(toc_match.group(1))
+        raw = re.sub(r"\t.*$", "", text).strip()
+        raw = re.sub(r"\s*\d+\s*$", "", raw).strip()
+        if not raw:
+            continue
+
+        full_number, clean_text = _split_number_text(raw)
+        if not full_number and not clean_text:
+            continue
+
+        items.append({
+            "level": level,
+            "full_number": full_number,
+            "clean_text": clean_text,
+        })
+    return items
+
+
+def _split_number_text(text: str) -> tuple[str, str]:
+    """把 '1.1. 总体描述' 拆成 ('1.1.', '总体描述')。
+    支持 '5.2.' 这种纯编号无文本（空标题）→ ('5.2.', '')。"""
+    m = re.match(r"^(\d+(?:\.\d+)*\.?)\s+(.*)$", text)
+    if m:
+        return m.group(1).strip(), m.group(2).strip()
+    m = re.match(r"^(\d+(?:\.\d+)*\.?)\s*$", text)
+    if m:
+        return m.group(1).strip(), ""
+    return "", text.strip()
+
+
+def _join_number_text(full_number: str, clean_text: str) -> str:
+    if full_number:
+        return f"{full_number} {clean_text}".strip()
+    return clean_text
+
+
+def _extract_headings_by_style(doc) -> list[dict]:
+    """无 TOC 时的回退方案：识别 Heading X 样式，配合 numbering 计算编号。"""
+    heading_texts = []
+    numbering_info = _parse_numbering(doc)
+    ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+    counters: dict = {}
     heading_num_id = None
 
     for para in doc.paragraphs:
         style_name = para.style.name if para.style else ""
         text = para.text.strip()
-
-        if style_name.lower() in ("toc heading", "tocheading") or text == "\u76ee\u5f55":
-            in_toc = True
-            continue
-
-        toc_match = re.match(r"toc\s*(\d)", style_name, re.IGNORECASE)
-        if toc_match:
-            level = int(toc_match.group(1))
-            clean = re.sub(r"\t.*$", "", text)
-            clean = re.sub(r"\s*\d+\s*$", "", clean).strip()
-            if clean:
-                toc_items.append({"level": level, "text": clean})
-            continue
-
-        if in_toc and not toc_match:
-            in_toc = False
 
         heading_match = re.match(r"[Hh]eading\s*(\d)", style_name)
         if heading_match and text:
@@ -190,9 +428,17 @@ def _extract_doc_structure(doc) -> dict:
             else:
                 numbered_text = text
 
-            heading_texts.append({"level": level, "text": numbered_text})
+            full_number, clean_text = _split_number_text(numbered_text)
+            if not clean_text:
+                clean_text = text
 
-    return {"headings": heading_texts, "toc": toc_items}
+            heading_texts.append({
+                "level": level,
+                "text": numbered_text,
+                "full_number": full_number,
+                "clean_text": clean_text,
+            })
+    return heading_texts
 
 
 def _parse_numbering(doc) -> dict | None:
@@ -387,15 +633,17 @@ def _compute_heading_number(numbering_info: dict, num_id: str, ilvl: int,
 
 
 def _remove_raw_toc(markdown_text: str, structure: dict) -> str:
-    if not structure["toc"]:
+    """移除 markdown 中由 mammoth 输出的原始 TOC 段落（toc 1/2/3/4 内容）。"""
+    if not structure.get("toc"):
         return markdown_text
 
     toc_texts = set()
     for item in structure["toc"]:
-        toc_texts.add(item["text"])
-        clean = re.sub(r"^\d+(\.\d+)*\.?\s*", "", item["text"]).strip()
-        if clean:
-            toc_texts.add(clean)
+        full = _join_number_text(item.get("full_number", ""), item.get("clean_text", ""))
+        if full:
+            toc_texts.add(full)
+        if item.get("clean_text"):
+            toc_texts.add(item["clean_text"])
 
     lines = markdown_text.split("\n")
     result = []
@@ -421,58 +669,228 @@ def _remove_raw_toc(markdown_text: str, structure: dict) -> str:
     return "\n".join(result)
 
 
+_HEADING_LOOKAHEAD = 3
+
+
 def _apply_structure(markdown_text: str, structure: dict) -> str:
+    """按 TOC/Headings 顺序，在 markdown 中定位"伪标题"行并替换为标准 # 形式。
+
+    支持的伪标题形式（来自 mammoth 对 docx 不同标题样式的转换结果）：
+      a) ``# / ## / ### ...`` 已是标题
+      b) ``1. **需求说明**`` 顶层有序列表 + 加粗（H1）
+      c) ``* + - 1. 启动页`` 嵌套列表项（多级标题）
+      d) ``   3. APP客户端`` 缩进有序列表（多级标题）
+      e) ``**需求说明**`` 单独加粗段落
+
+    对空 clean_text 的"占位标题"（如 docx 中 '5.2.' 没有文本内容），
+    它们在 mammoth 输出中没有对应可见行，会在下一个匹配标题之前主动插入；
+    若是末尾标题则追加在文档末尾。
+    """
+    headings = structure.get("headings", [])
+
+    toc_block = _build_toc_block(headings)
+
     lines = markdown_text.split("\n")
-    result = []
-    headings = structure["headings"]
-    toc = structure["toc"]
-    heading_index = 0
-
-    toc_block = ""
-    if toc:
-        toc_block = "\n---\n**[[ 文档目录 ]]**\n\n"
-        for item in toc:
-            indent = "  " * (item["level"] - 1)
-            toc_block += f"{indent}- {item['text']}\n"
-        toc_block += "---\n"
-
+    result: list[str] = []
+    h_idx = 0
     toc_inserted = False
+
+    def _flush_empty_headings_until(target_idx: int) -> None:
+        """h_idx 推进到 target_idx 之前，把中间未匹配的空 clean_text heading 输出。"""
+        nonlocal h_idx
+        while h_idx < target_idx:
+            h = headings[h_idx]
+            if not (h.get("clean_text") or "").strip():
+                result.append("")
+                result.append(_build_heading_line(h))
+                result.append("")
+            h_idx += 1
 
     for line in lines:
         stripped = line.strip()
 
-        if not toc_inserted and (stripped == "\u76ee\u5f55" or stripped == "**\u76ee\u5f55**"):
+        if not toc_inserted and toc_block and (
+            stripped == "\u76ee\u5f55"
+            or stripped == "**\u76ee\u5f55**"
+            or stripped == "**\u76ee \u5f55**"
+        ):
             result.append(toc_block)
             toc_inserted = True
             continue
 
-        heading_m = re.match(r"^(#{1,6})\s+(.+)$", stripped)
-        if heading_m:
-            heading_text = heading_m.group(2).strip()
-            if heading_index < len(headings):
-                expected = headings[heading_index]
-                if _text_similar(heading_text, expected["text"]):
-                    correct_level = expected["level"]
-                    result.append(f"\n{'#' * correct_level} {expected['text']}\n")
-                    heading_index += 1
+        if h_idx < len(headings):
+            cand = _extract_heading_candidate_text(line)
+            if cand:
+                match_idx = _find_matching_heading(cand, headings, h_idx, _HEADING_LOOKAHEAD)
+                if match_idx >= 0:
+                    _flush_empty_headings_until(match_idx)
+                    target = headings[match_idx]
+                    result.append("")
+                    result.append(_build_heading_line(target))
+                    result.append("")
+                    h_idx = match_idx + 1
                     continue
-            result.append(line)
-            continue
 
         result.append(line)
 
-    if toc and not toc_inserted:
+    _flush_empty_headings_until(len(headings))
+
+    if toc_block and not toc_inserted:
         result.insert(0, toc_block)
 
     return "\n".join(result)
 
 
+def _build_toc_block(headings: list[dict]) -> str:
+    """基于完整 headings 清单（含推断出的深层标题）生成文档目录块。"""
+    if not headings:
+        return ""
+    block = "\n---\n**[[ 文档目录 ]]**\n\n"
+    for item in headings:
+        level = max(1, min(6, int(item.get("level", 1))))
+        indent = "  " * (level - 1)
+        full = item.get("text") or _join_number_text(
+            item.get("full_number", ""), item.get("clean_text", "")
+        )
+        block += f"{indent}- {full}\n"
+    block += "---\n"
+    return block
+
+
+def _build_heading_line(target: dict) -> str:
+    level = target["level"]
+    full_number = target.get("full_number", "")
+    if "clean_text" in target:
+        clean_text = target.get("clean_text") or ""
+    else:
+        clean_text = target.get("text", "")
+    if full_number and clean_text:
+        return f"{'#' * level} {full_number} {clean_text}"
+    if full_number:
+        return f"{'#' * level} {full_number}"
+    return f"{'#' * level} {clean_text}".rstrip()
+
+
+def _find_matching_heading(candidate: str, headings: list[dict],
+                           start: int, lookahead: int) -> int:
+    """在 [start, start+lookahead) 范围内查找文本相似的 heading，返回索引或 -1。"""
+    end = min(start + lookahead, len(headings))
+    for i in range(start, end):
+        if _text_similar(candidate, headings[i].get("clean_text", "")):
+            return i
+    return -1
+
+
+_INLINE_DECOR_PATTERN = re.compile(r"(\*\*|__|~~|`)+")
+
+
+def _strip_inline_decor(text: str) -> str:
+    """去除 markdown 行内修饰符 (** __ ~~ `) 仅保留纯文本。"""
+    text = _INLINE_DECOR_PATTERN.sub("", text)
+    return text.strip()
+
+
+def _strip_leading_number(text: str) -> str:
+    """去除前导编号 ``1.``、``1.2.``、``1)`` 等。"""
+    return re.sub(r"^\s*\d+(?:\.\d+)*[\.\)]?\s*", "", text)
+
+
+def _extract_heading_candidate_text(line: str) -> str | None:
+    """从 markdown 行中提取候选标题文本（清理掉编号和修饰符）。
+    返回 None 表示不是标题候选。
+
+    设计原则：宁可提取过多候选，由 _find_matching_heading 通过 TOC 文本匹配做最终过滤。
+    """
+    stripped = line.strip()
+    if not stripped:
+        return None
+
+    m = re.match(r"^(#{1,6})\s+(.+?)\s*$", stripped)
+    if m:
+        text = _strip_inline_decor(m.group(2))
+        text = _strip_leading_number(text).strip()
+        return text or None
+
+    m = re.match(r"^(\d+)\.\s+\*\*(.+?)\*\*\s*$", stripped)
+    if m:
+        return _strip_inline_decor(m.group(2)).strip() or None
+
+    m = re.match(r"^[*+\-](?:\s+[*+\-])*\s+\d+\.\s+(.+?)\s*$", stripped)
+    if m:
+        text = _strip_inline_decor(m.group(1))
+        text = _strip_leading_number(text).strip()
+        return text or None
+
+    if line and (line.startswith(" ") or line.startswith("\t")):
+        m = re.match(r"^\s+(\d+)\.\s+(.+?)\s*$", line)
+        if m:
+            text = _strip_inline_decor(m.group(2))
+            text = _strip_leading_number(text).strip()
+            return text or None
+
+    m = re.match(r"^(\d+)\.\s+(.+?)\s*$", stripped)
+    if m:
+        text = _strip_inline_decor(m.group(2))
+        text = _strip_leading_number(text).strip()
+        if text and not _looks_like_list_content(text):
+            return text
+
+    m = re.match(r"^\*\*(.+?)\*\*\s*$", stripped)
+    if m:
+        text = m.group(1).strip()
+        if 1 <= len(text) <= 60 and not text.endswith(("：", ":", "。", ".")):
+            text = _strip_leading_number(text).strip()
+            return text or None
+
+    if 2 <= len(stripped) <= 30:
+        if not any(ch in stripped for ch in "。；;，,：:！!？?\u3002\uff1b\uff0c\uff1a\uff01\uff1f"):
+            text = _strip_inline_decor(stripped)
+            text = _strip_leading_number(text).strip()
+            if text and re.search(r"[\u4e00-\u9fff\w]", text):
+                return text
+
+    return None
+
+
+def _looks_like_list_content(text: str) -> bool:
+    """判断文本是否看起来像普通列表内容而非标题。
+    标题通常较短、不含句末标点、不含赋值符号等。"""
+    if len(text) > 40:
+        return True
+    if any(ch in text for ch in "。；;"):
+        return True
+    if text.endswith(("，", ",", "：", ":")):
+        return True
+    if "=" in text and not re.search(r"[\u4e00-\u9fff]{3,}$", text):
+        return True
+    return False
+
+
+_HEADING_TAIL_DELIM = "-—–_(（[【\\、:：/／"
+
+
 def _text_similar(a: str, b: str) -> bool:
-    def normalize(s):
-        s = re.sub(r"^\d+(\.\d+)*\.?\s*", "", s)
+    """文本是否相似（忽略编号、空白、大小写）。
+    支持候选文本以目标开头并紧跟分隔符的情况，例如：
+      候选 "用户组织--功能没有"  目标 "用户组织"  -> 相似
+      候选 "（一级）用户管理--已经有了" 目标 "（一级）用户管理" -> 相似
+    """
+    def normalize(s: str) -> str:
+        s = re.sub(r"^\d+(\.\d+)*[\.\)]?\s*", "", s)
         s = re.sub(r"\s+", "", s)
+        s = s.replace("\uff5e", "~")
         return s.lower()
-    return normalize(a) == normalize(b)
+
+    na, nb = normalize(a), normalize(b)
+    if na == nb:
+        return True
+
+    if len(nb) >= 3 and len(na) > len(nb) and na.startswith(nb):
+        next_ch = na[len(nb)]
+        if next_ch in _HEADING_TAIL_DELIM:
+            return True
+
+    return False
 
 
 def _fix_ordered_lists(text: str) -> str:
@@ -986,9 +1404,6 @@ def convert_pdf(input_path: Path, output_dir: Path, embed_images: bool = False,
 
     header = _build_header(input_path, f"PDF ({engine})", image_count)
     markdown_text = header + markdown_text
-
-    if not embed_images:
-        markdown_text = _add_image_index(markdown_text, images_dir, stem)
 
     if progress_cb:
         progress_cb(90, "saving...")
@@ -1685,35 +2100,6 @@ def _clean_markdown(text: str) -> str:
 
 def _build_header(input_path: Path, doc_type: str, image_count: int) -> str:
     return f"---\nsource: {input_path.name}\ntype: {doc_type}\nimages: {image_count}\n---\n\n"
-
-
-def _add_image_index(markdown_text: str, images_dir: Path, stem: str) -> str:
-    images = sorted(f for f in images_dir.glob("*") if f.is_file() and f.stat().st_size > 0)
-    if not images:
-        return markdown_text
-
-    viewable = [f for f in images if f.suffix.lower() in AI_VIEWABLE_EXTS]
-    other = [f for f in images if f.suffix.lower() not in AI_VIEWABLE_EXTS]
-
-    index = "\n\n---\n\n## AI Image Index\n\n"
-    index += f"Total: {len(images)} images ({len(viewable)} viewable by AI)\n\n"
-
-    if viewable:
-        index += "### Viewable (png/jpg/gif/webp)\n\n"
-        for i, img in enumerate(viewable, 1):
-            rel = f"{stem}_images/{img.name}"
-            kb = img.stat().st_size / 1024
-            index += f"{i}. `{rel}` ({kb:.1f} KB)\n"
-            index += f"   ![img{i}]({rel})\n\n"
-
-    if other:
-        index += "### Other formats (not directly viewable)\n\n"
-        for i, img in enumerate(other, 1):
-            rel = f"{stem}_images/{img.name}"
-            kb = img.stat().st_size / 1024
-            index += f"- `{rel}` ({kb:.1f} KB)\n"
-
-    return markdown_text + index
 
 
 def _embed_images_in_md(markdown_text: str, images_dir: Path) -> str:
